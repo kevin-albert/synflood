@@ -5,7 +5,7 @@ ifneq ($(shell uname -s),Darwin)
 	CC += -pthread
 endif
 
-$(EXE): synflood.o 
+$(EXE): synflood
 
 clean: 
 	rm $(EXE) *.o
