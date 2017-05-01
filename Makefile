@@ -1,7 +1,4 @@
 CC		= gcc -Ofast
-EXE		= synflood
-
-$(EXE): synflood
-
+synflood: synflood.c
 clean: 
-	rm $(EXE) *.o
+	rm -f synflood
